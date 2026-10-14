@@ -63,8 +63,10 @@ class LazyEntries:
             self._load()
         if self._file is None:
             self._file = self._path.open("rb")
-        self._file.seek(int(self._starts[i]))
-        return self._file.read(int(self._ends[i] - self._starts[i])).decode()
+        # pread, not seek + read: reference-prompt lookups call this from the
+        # loader's IO threads, and a shared file position would interleave reads.
+        start, end = int(self._starts[i]), int(self._ends[i])
+        return os.pread(self._file.fileno(), end - start, start).decode()
 
     def __getstate__(self) -> dict[str, object]:
         return {"_path": self._path, "_rank": self._rank, "_world": self._world}

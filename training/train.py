@@ -191,6 +191,16 @@ def main(config_path: str):
         num_bucket_batches=args.data.num_bucket_batches,
         prompt_trim_max_sec=args.data.prompt_trim_max_sec,
         final_punct_dropout=args.data.final_punct_dropout,
+        prompt_trim_prob=args.data.prompt_trim_prob,
+        tashkeel_dropout_all=args.data.tashkeel_dropout_all,
+        tashkeel_dropout_word=args.data.tashkeel_dropout_word,
+        ref_only_prob=args.data.ref_only_prob,
+        ref_ctx_prob=args.data.ref_ctx_prob,
+        min_ref_prompt_sec=args.data.min_ref_prompt_sec,
+        max_ref_prompt_sec=args.data.max_ref_prompt_sec,
+        interleave_probs=args.data.interleave_probs,
+        interleave_min_piece_sec=args.data.interleave_min_piece_sec,
+        interleave_punct_weight=args.data.interleave_punct_weight,
     )
     train_loader = iter(train_data)
 
@@ -232,6 +242,7 @@ def main(config_path: str):
                     voice_prompt_latents,
                     update_stats=step < args.stats_ema_steps,
                     num_voice_prompt_frames=num_voice_prompt_frames,
+                    text_pieces=batch.text_pieces,
                 )
             # Under DDP, allreduce only on the last micro-batch.
             last_micro = micro == args.grad_accum_steps - 1

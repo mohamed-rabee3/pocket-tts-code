@@ -1,0 +1,67 @@
+# Saudi-dialect Pocket TTS teacher (24 layers), fine-tuned from the English
+# 2026-09 teacher with a fresh Arabic text embedding (finetune_language recipe).
+model_config: pocket_tts/config/english_2026-09_24l.yaml
+model_overrides:
+  flow_lm.lookup_table.tokenizer_path: /data/saudi-tts/segments/tokenizer.json
+start_from_pretrained: true
+reset_text_embedding: true
+
+data:
+  train_jsonl: /data/saudi-tts/segments/train_aligned.jsonl
+  valid_jsonl: /data/saudi-tts/segments/valid_aligned.jsonl
+  max_duration_sec: 30.0
+  max_voice_prompt_sec: 5.0        # cap on the "preceding audio" part of the prompt
+  # Voice prompt modes: 35% reference clip only (start of an agent turn),
+  # 45% reference + preceding audio (later chunks of a turn), 20% preceding only.
+  ref_only_prob: 0.35
+  ref_ctx_prob: 0.45
+  min_ref_prompt_sec: 1.5
+  max_ref_prompt_sec: 5.0
+  # Keep most prompts exactly contiguous with the target so pause timing at
+  # chunk boundaries is learned precisely; trim 30% for robustness.
+  prompt_trim_max_sec: 0.5
+  prompt_trim_prob: 0.3
+  final_punct_dropout: 0.3
+  # The LLM writes the training convention; light dropout covers its slips.
+  tashkeel_dropout_all: 0.05
+  tashkeel_dropout_word: 0.03
+  # Interleaved text (seamless streaming): 0/1/2/3 extra text pieces inserted
+  # mid-target at word boundaries, each followed by an EOS probe. Inference appends
+  # the next sentence to the running sequence instead of starting a new utterance.
+  interleave_probs: [0.3, 0.3, 0.25, 0.15]
+  interleave_min_piece_sec: 1.0
+  interleave_punct_weight: 4.0
+  loader_procs: 6
+  num_bucket_batches: 5
+  precompute: true
+
+flow:
+  type: lsd
+  kwargs: {}
+
+flow_batch_multiplier: 4
+eos_loss_weight: 0.1
+text_dropout: 0.2
+voice_dropout: 0.2
+
+optim:
+  lr: 2e-4             # text embedding starts random, the backbone has to move with it
+  schedule: constant
+  warmup_steps: 1000
+
+run_dir: /data/saudi-tts/runs/teacher
+batch_size: 32
+grad_accum_steps: 2    # effective batch 64, as in the reference recipe
+max_steps: 400000      # run to completion (~3.3 days); checkpoints every 2500
+stats_ema_steps: 1000
+ema_decay: 0.999
+log_freq: 50
+valid_freq: 2500
+num_valid_batches: 20
+ckpt_freq: 2500
+num_ckpt_keep: 4
+sample_freq: 5000
+sample_cfg_coef: 2.0
+sample_sentences:
+  - "بِمَعنَى أَن المُشكِلَة فِي الِافتِقَار لِلِاتِّجَاه وَلَيس بِضِيق الوَقت"
+  - "بِالإِضَافَة ل أَنَا عِندِي كُورس قَاعدَة يَعنِي أَدرِس لَه، وَلَازِم أَنجَح فِيه."

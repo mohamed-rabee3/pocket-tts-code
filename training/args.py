@@ -30,6 +30,28 @@ class DataArgs:
     # distribution). Set to 0 to disable.
     prompt_trim_max_sec: float = 0.5
     final_punct_dropout: float = 0.3
+    # Probability that prompt_trim_max_sec trimming is applied at all (1 = every prompt).
+    prompt_trim_prob: float = 1.0
+    # Tashkeel dropout (Arabic): strip every mark of the target text with probability
+    # tashkeel_dropout_all, else each word's marks with probability tashkeel_dropout_word.
+    tashkeel_dropout_all: float = 0.0
+    tashkeel_dropout_word: float = 0.0
+    # Voice prompt modes (need a "speaker" field in the manifest): with probability
+    # ref_only_prob the prompt is the start of another utterance of the same speaker and
+    # the target is this whole utterance; with ref_ctx_prob it is that reference followed
+    # by the audio just before the cut; otherwise the upstream contiguous prompt.
+    ref_only_prob: float = 0.0
+    ref_ctx_prob: float = 0.0
+    min_ref_prompt_sec: float = 1.5
+    max_ref_prompt_sec: float = 5.0
+    # Interleaved text for seamless streaming: the target's transcript is split at
+    # word boundaries (mid-pause) into pieces laid out as
+    #   [voice, text_1, audio_1, <eos probe>, text_2, audio_2, ...]
+    # so at inference the next sentence's text can be appended mid-utterance.
+    # interleave_probs[k] = probability of k extra pieces (latent mode only).
+    interleave_probs: list[float] = field(default_factory=lambda: [1.0])
+    interleave_min_piece_sec: float = 1.0
+    interleave_punct_weight: float = 4.0  # preference for splitting after punctuation
     shuffle: bool = True
     # Loader subprocesses per rank. Each one is GIL-bound at ~90 samples/s from
     # network storage (extra IO threads do not help), and a rank consumes
@@ -65,6 +87,10 @@ class OptimArgs:
     # a cosine fine-tune.
     schedule: str = "constant"
     lr_min_ratio: float = 0.0
+    # Step the warmup and the schedule count from. For a cooldown resumed from a
+    # constant-LR checkpoint at step S (fresh optimizer): schedule_start_step S,
+    # max_steps S + cooldown length, and a short warmup for the new Adam moments.
+    schedule_start_step: int = 0
     # "adamw", or "muon": Newton-Schulz orthogonalized momentum on the backbone's 2D
     # weights (the fused q/k/v projection orthogonalized as three blocks), AdamW on
     # everything else. muon_lr is the Muon step size; the AdamW groups keep `lr`, and

@@ -101,3 +101,122 @@ def build_sequences_with_conditions(
         -1, audio_emb.shape[-1]
     )
     return x, prefix_lengths
+
+
+def build_interleaved_sequences(
+    args: TrainArgs,
+    normalized_latents: torch.Tensor,
+    text_tokens: list[torch.Tensor],
+    text_pieces: list[list[tuple[int, torch.Tensor]]],
+    voice_latents: torch.Tensor,
+    cfg_dropout: bool,
+    fl: FlowLMModel,
+    num_voice_prompt_frames: torch.Tensor | None = None,
+    force_null: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Rows with text inserted mid-audio, for seamless streaming inference:
+
+        [bos_prefix, voice, text_1, audio[0:s_2], probe, text_2, audio[s_2:s_3], probe, ...]
+
+    Piece 1 is text_tokens[b] (starting at frame 0); text_pieces[b] lists the later
+    pieces as (start frame, tokens). A probe repeats the input of the next piece's
+    first frame (the previous latent) and is trained to emit EOS: at inference the
+    model signals the end of the current text there, the next text is appended to
+    the KV cache, and generation resumes from that same latent.
+
+    Returns (x, frame_idx [B, T]: position of every audio frame, probe_idx [B, P],
+    probe_mask [B, P]). Positions are computed host-side; rows are right-padded.
+    """
+    B, T_audio = normalized_latents.shape[:2]
+    device = normalized_latents.device
+    bos = fl.bos_emb.view(1, 1, -1).expand(B, 1, -1)
+    audio_in = torch.cat([bos, normalized_latents[:, :-1]], dim=1)
+    audio_emb = fl.input_linear(audio_in)
+    dtype = audio_emb.dtype
+    voice_emb = F.linear(voice_latents.to(fl.speaker_proj_weight.dtype), fl.speaker_proj_weight)
+    Tv = voice_emb.shape[1]
+
+    if force_null:
+        keep_voice_prob, keep_text_prob = 0.0, 0.0
+    elif cfg_dropout:
+        keep_voice_prob, keep_text_prob = 1 - args.voice_dropout, 1 - args.text_dropout
+    else:
+        keep_voice_prob, keep_text_prob = 1.0, 1.0
+    keep_voice_cpu = torch.rand(B) < keep_voice_prob
+    keep_text_cpu = torch.rand(B) < keep_text_prob
+    if num_voice_prompt_frames is not None:
+        v_len_cpu = num_voice_prompt_frames.cpu().long().clamp(max=Tv) * keep_voice_cpu
+    else:
+        v_len_cpu = torch.full((B,), Tv, dtype=torch.long) * keep_voice_cpu
+
+    row_tokens, tok_pos, frame_pos, probe_pos, probe_src, row_len = [], [], [], [], [], []
+    for b in range(B):
+        pieces = [(0, text_tokens[b]), *text_pieces[b]]
+        pos = 1 + int(v_len_cpu[b])
+        toks, tp, fp, pp, ps = [], [], [], [], []
+        for j, (start, tokens) in enumerate(pieces):
+            if keep_text_cpu[b]:
+                toks.append(tokens)
+                tp.extend(range(pos, pos + tokens.shape[0]))
+                pos += tokens.shape[0]
+            end = pieces[j + 1][0] if j + 1 < len(pieces) else T_audio
+            fp.extend(range(pos, pos + end - start))
+            pos += end - start
+            if j + 1 < len(pieces):
+                pp.append(pos)
+                ps.append(end)
+                pos += 1
+        row_tokens.append(torch.cat(toks) if toks else torch.zeros(0, dtype=torch.long))
+        tok_pos.append(tp)
+        frame_pos.append(fp)
+        probe_pos.append(pp)
+        probe_src.append(ps)
+        row_len.append(pos)
+
+    max_len = max(row_len)
+    x = torch.zeros(B, max_len, audio_emb.shape[-1], device=device, dtype=dtype)
+    x[:, 0] = fl.bos_before_voice[0].to(dtype)
+    rows = torch.arange(B, device=device)
+    v_len = v_len_cpu.to(device)
+    vpos = 1 + torch.arange(Tv, device=device)
+    vmask = torch.arange(Tv, device=device)[None, :] < v_len[:, None]
+    x[rows[:, None].expand(-1, Tv)[vmask], vpos[None, :].expand(B, -1)[vmask]] = voice_emb.to(
+        dtype
+    )[vmask]
+
+    # Text: one LUT lookup over the padded concatenation of each row's kept pieces.
+    pad_id = fl.conditioner.embed.num_embeddings - 1
+    Lmax = max(1, max(t.shape[0] for t in row_tokens))
+    text_pad_cpu = torch.full((B, Lmax), pad_id, dtype=torch.long)
+    t_rows, t_cols, t_pos = [], [], []
+    for b, t in enumerate(row_tokens):
+        text_pad_cpu[b, : t.shape[0]] = t
+        t_rows += [b] * t.shape[0]
+        t_cols += list(range(t.shape[0]))
+        t_pos += tok_pos[b]
+    text_emb = fl.conditioner(text_pad_cpu.to(device)).to(dtype)
+    if t_rows:
+        tr = torch.tensor(t_rows, device=device)
+        x[tr, torch.tensor(t_pos, device=device)] = text_emb[
+            tr, torch.tensor(t_cols, device=device)
+        ]
+    x[:, 0] = x[:, 0] + 0.0 * text_emb.sum()  # keep the LUT in the graph (see above)
+
+    frame_idx = torch.tensor(frame_pos, dtype=torch.long, device=device)  # [B, T_audio]
+    x[rows[:, None].expand(-1, T_audio).reshape(-1), frame_idx.reshape(-1)] = audio_emb.reshape(
+        -1, audio_emb.shape[-1]
+    )
+    P = max(1, max(len(p) for p in probe_pos))
+    probe_idx_cpu = torch.zeros(B, P, dtype=torch.long)
+    probe_src_cpu = torch.zeros(B, P, dtype=torch.long)
+    probe_mask_cpu = torch.zeros(B, P, dtype=torch.bool)
+    for b in range(B):
+        n = len(probe_pos[b])
+        probe_idx_cpu[b, :n] = torch.tensor(probe_pos[b], dtype=torch.long)
+        probe_src_cpu[b, :n] = torch.tensor(probe_src[b], dtype=torch.long)
+        probe_mask_cpu[b, :n] = True
+    probe_idx, probe_mask = probe_idx_cpu.to(device), probe_mask_cpu.to(device)
+    if probe_mask_cpu.any():
+        pr = rows[:, None].expand(-1, P)[probe_mask]
+        x[pr, probe_idx[probe_mask]] = audio_emb[pr, probe_src_cpu.to(device)[probe_mask]]
+    return x, frame_idx, probe_idx, probe_mask

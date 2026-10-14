@@ -225,6 +225,14 @@ def main(
             "output order is restored per window"
         ),
     ] = 256,
+    strip_marks: Annotated[
+        bool,
+        typer.Option(
+            help="align on the Arabic letter skeleton (tashkeel removed); the output keeps "
+            "the transcript's own words. For diacritized dialect text whose marks the CTC "
+            "model (trained on MSA tashkeel) would mis-align."
+        ),
+    ] = False,
 ):
     logging.basicConfig(
         level=logging.INFO,
@@ -233,6 +241,13 @@ def main(
     )
     device_t = torch.device(device)
     ctc_model, vocab, blank, delim, fold, sr, use_bf16 = _load_ctc_model(model, device_t)
+    if strip_marks:
+        from pocket_tts.arabic_text import strip_tashkeel
+
+        case_fold = fold
+
+        def fold(s: str) -> str:
+            return strip_tashkeel(case_fold(s))
 
     done = _resume_done(output_jsonl) if resume else set()
 

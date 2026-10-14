@@ -25,7 +25,7 @@ def prepare_text_prompt(
         text = " ".join(text.translate(str.maketrans(replace_characters)).split())
         # Deleted quotes leave '"Hi?", she said' as 'Hi?, she said', which reads as a sentence end
         # followed by a stray comma; keep the sentence mark only.
-        text = re.sub(r"([.!?\u2026])\s*[,;:]", r"\1", text)
+        text = re.sub(r"([.!?\u2026\u061f])\s*[,;:\u060c\u061b]", r"\1", text)
     if text == "":
         raise ValueError("Text prompt cannot be empty")
     text = text.replace("\n", " ").replace("\r", " ").replace("  ", " ")
@@ -53,8 +53,11 @@ def prepare_text_prompt(
     return text, frames_after_eos_guess
 
 
-_TERMINAL_PUNCTUATION = ".!?\u2026"
-_WEAK_PUNCTUATION = ",;:-\u2013\u2014"
+# Arabic: \u061f question mark, \u060c comma, \u061b semicolon.
+_TERMINAL_PUNCTUATION = ".!?\u2026\u061f"
+_WEAK_PUNCTUATION = ",;:-\u2013\u2014\u060c\u061b"
+_SENTENCE_MARKS = (".", "!", "...", "?", "..", "\u2026", "\u061f", "?!", "!!", "\u061f\u061f")
+_CLAUSE_MARKS = (",", ";", ":", "\u060c", "\u061b")
 _CLOSERS = "\"'\u201d\u2019)]\u00bb"
 
 
@@ -77,6 +80,22 @@ def _ensure_terminal_punctuation(text: str) -> str:
     if core[-1] in _WEAK_PUNCTUATION:
         return core.rstrip(_WEAK_PUNCTUATION + " ") + "." + closers
     return text + "."
+
+
+def _punctuation_tokens(tokenizer: Tokenizer, marks: tuple[str, ...]) -> list[int]:
+    """Ids of the tokens that are only punctuation from `marks`, in this tokenizer.
+
+    Tokenizing each mark on its own (dropping the leading word-boundary piece)
+    finds e.g. Arabic '\u061f' or '..', which a fixed Latin string would miss.
+    """
+    chars = set("".join(marks))
+    ids = set()
+    for mark in marks:
+        for token in tokenizer(mark)[0].tolist():
+            piece = tokenizer.decode([token]).strip()
+            if piece and set(piece) <= chars:
+                ids.add(token)
+    return sorted(ids)
 
 
 def _is_decimal_period_boundary(
@@ -162,7 +181,7 @@ def split_into_best_sentences(
     tokens = tokenizer(text_to_generate)
     list_of_tokens = tokens[0].tolist()
 
-    _, *end_of_sentence_tokens = tokenizer(".!...?")[0].tolist()
+    end_of_sentence_tokens = _punctuation_tokens(tokenizer, _SENTENCE_MARKS)
     sentence_boundaries = _find_boundary_indices(
         list_of_tokens, end_of_sentence_tokens, tokenizer, skip_decimal_periods=True
     )
@@ -171,7 +190,7 @@ def split_into_best_sentences(
     )
 
     # Sub-split oversized sentences on commas, semicolons, and colons to prevent skipped words
-    _, *fallback_tokens = tokenizer(",;:")[0].tolist()
+    fallback_tokens = _punctuation_tokens(tokenizer, _CLAUSE_MARKS)
     refined_segments = []
     for nb_tokens, text in nb_tokens_and_sentences:
         if nb_tokens <= max_tokens:

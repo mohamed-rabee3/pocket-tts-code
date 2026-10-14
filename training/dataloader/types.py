@@ -23,6 +23,7 @@ class Entry:
     words: list[dict[str, Any]] | None = None  # [{"word", "start", "end"}] from align_data
     start: float = 0.0  # offset of the utterance inside the audio file (long recordings)
     latents_file: str | None = None
+    speaker: str | None = None  # groups utterances for reference voice prompts
 
 
 @dataclass
@@ -34,3 +35,6 @@ class Batch:
     num_voice_prompt_frames: torch.Tensor  # [B] valid codec frames of each voice prompt
     tail_latents: torch.Tensor | None = None
     prompt_latents: torch.Tensor | None = None
+    # Interleaved text: per row, [(target frame where the piece starts, tokens), ...]
+    # for pieces after the first (whose tokens are text_tokens). None = no interleaving.
+    text_pieces: list[list[tuple[int, torch.Tensor]]] | None = None

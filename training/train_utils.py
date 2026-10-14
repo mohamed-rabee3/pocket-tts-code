@@ -112,11 +112,12 @@ def _compile_models(model: TrainableTTS, mimi: MimiModel):
 
 def lr_at(step: int, args: TrainArgs) -> float:
     lr = args.optim.lr
+    step -= args.optim.schedule_start_step
     if step < args.optim.warmup_steps:
-        return lr * (step + 1) / args.optim.warmup_steps
+        return lr * (max(step, 0) + 1) / args.optim.warmup_steps
     if args.optim.schedule == "cosine":
         progress = (step - args.optim.warmup_steps) / max(
-            1, args.max_steps - args.optim.warmup_steps
+            1, args.max_steps - args.optim.schedule_start_step - args.optim.warmup_steps
         )
         floor = lr * args.optim.lr_min_ratio
         return floor + 0.5 * (lr - floor) * (1 + math.cos(math.pi * min(1.0, progress)))

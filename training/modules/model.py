@@ -20,7 +20,7 @@ from pocket_tts.models.flow_lm import FlowLMModel
 from pocket_tts.modules.stateful_module import ModelState, increment_steps, init_states
 
 from ..args import TrainArgs
-from .conditioner import build_sequences_with_conditions
+from .conditioner import build_interleaved_sequences, build_sequences_with_conditions
 from .samplers import FlowType
 from .utils import set_state_padding, stamp_state_names
 
@@ -59,6 +59,8 @@ class TrainableTTS(nn.Module):
         update_stats: bool = False,
         num_voice_prompt_frames: torch.Tensor
         | None = None,  # [B] valid voice frames (rest is padding)
+        # Interleaved text (see build_interleaved_sequences); None = single text prefix.
+        text_pieces: list[list[tuple[int, torch.Tensor]]] | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         fl = self.flow_lm
         _, T, C = latents.shape
@@ -66,36 +68,66 @@ class TrainableTTS(nn.Module):
             self._update_latent_stats(latents, mask)
         normalized_latents = (latents - fl.emb_mean) / fl.emb_std
 
+        interleaved = text_pieces is not None and any(text_pieces)
+
         def backbone_z(
             module: FlowLMModel, cfg_dropout: bool, force_null: bool = False
-        ) -> torch.Tensor:
-            x, prefix_lengths = build_sequences_with_conditions(
-                self.args,
-                normalized_latents,
-                text_tokens,
-                voice_latents,
-                cfg_dropout=cfg_dropout,
-                num_voice_prompt_frames=num_voice_prompt_frames,
-                fl=module,
-                force_null=force_null,
-            )
+        ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+            """(z at every audio frame [B, T, dim], z at EOS probes [B, P, dim], probe mask)."""
+            if interleaved:
+                x, idx, probe_idx, probe_mask = build_interleaved_sequences(
+                    self.args,
+                    normalized_latents,
+                    text_tokens,
+                    text_pieces,
+                    voice_latents,
+                    cfg_dropout=cfg_dropout,
+                    num_voice_prompt_frames=num_voice_prompt_frames,
+                    fl=module,
+                    force_null=force_null,
+                )
+            else:
+                x, prefix_lengths = build_sequences_with_conditions(
+                    self.args,
+                    normalized_latents,
+                    text_tokens,
+                    voice_latents,
+                    cfg_dropout=cfg_dropout,
+                    num_voice_prompt_frames=num_voice_prompt_frames,
+                    fl=module,
+                    force_null=force_null,
+                )
+                idx = prefix_lengths[:, None] + torch.arange(T, device=x.device)[None, :]
+                probe_idx = probe_mask = None
             out = module.out_norm(module.transformer(x, model_state=None))
-            idx = prefix_lengths[:, None] + torch.arange(T, device=out.device)[None, :]
-            return out.gather(1, idx[:, :, None].expand(-1, -1, out.shape[-1]))
+            z = out.gather(1, idx[:, :, None].expand(-1, -1, out.shape[-1]))
+            if probe_idx is None:
+                return z, None, None
+            zp = out.gather(1, probe_idx[:, :, None].expand(-1, -1, out.shape[-1]))
+            return z, zp, probe_mask
 
-        z = backbone_z(fl, cfg_dropout=self.training)  # [B, T, dim]
+        z, z_probe, probe_mask = backbone_z(fl, cfg_dropout=self.training)  # z: [B, T, dim]
 
         if self.distill_teacher is not None:
             # Latent CFG distillation: the student's backbone regresses onto the
             # teacher's guidance-combined output; flow/EOS heads stay frozen.
             teacher = self.distill_teacher.to(latents.device)
+            coef = self.args.distill_cfg_coef
             with torch.no_grad():
-                z_cond = backbone_z(teacher, cfg_dropout=False)
-                z_null = backbone_z(teacher, cfg_dropout=False, force_null=True)
-                z_t = z_null + self.args.distill_cfg_coef * (z_cond - z_null)
+                z_cond, zp_cond, _ = backbone_z(teacher, cfg_dropout=False)
+                if coef == 1.0:  # no guidance: the null pass cancels out, skip it
+                    z_t, zp_t = z_cond, zp_cond
+                else:
+                    z_null, zp_null, _ = backbone_z(teacher, cfg_dropout=False, force_null=True)
+                    z_t = z_null + coef * (z_cond - z_null)
+                    zp_t = zp_null + coef * (zp_cond - zp_null) if zp_cond is not None else None
             shifted_mask = torch.cat([mask[:, :1], mask[:, :-1]], dim=1)
-            denom = shifted_mask.sum().clamp(min=1)
-            loss = ((z - z_t).square().mean(dim=-1) * shifted_mask).sum() / denom
+            num = ((z - z_t).square().mean(dim=-1) * shifted_mask).sum()
+            denom = shifted_mask.sum()
+            if z_probe is not None:
+                num = num + ((z_probe - zp_t).square().mean(dim=-1) * probe_mask).sum()
+                denom = denom + probe_mask.sum()
+            loss = num / denom.clamp(min=1)
             return loss, {"distill_mse": loss.detach(), "loss": loss.detach()}
 
         # EOS loss: 1 on the first invalid position, computed over valid
@@ -105,7 +137,13 @@ class TrainableTTS(nn.Module):
         eos_logits = fl.out_eos(z).squeeze(-1)
         shifted_mask = torch.cat([mask[:, :1], mask[:, :-1]], dim=1)
         eos_loss = is_eos * F.softplus(-eos_logits) + ~is_eos * F.softplus(eos_logits)
-        eos_loss = (eos_loss * shifted_mask).sum() / shifted_mask.sum().clamp(min=1)
+        eos_num, eos_den = (eos_loss * shifted_mask).sum(), shifted_mask.sum()
+        if z_probe is not None:
+            # Each probe ends a text piece mid-utterance: EOS = 1 there.
+            probe_logits = fl.out_eos(z_probe).squeeze(-1)
+            eos_num = eos_num + (F.softplus(-probe_logits) * probe_mask).sum()
+            eos_den = eos_den + probe_mask.sum()
+        eos_loss = eos_num / eos_den.clamp(min=1)
 
         # Flow loss on valid positions, optionally with several noise draws per
         # position (flow_batch_multiplier).

@@ -1,0 +1,71 @@
+# 6-layer CPU student distilled from the Saudi 24-layer teacher at step 140000
+# (training/configs/depth_distill.yaml recipe). Picked over the cosine cooldown
+# (evals/tb_*): 0 failures on the 80-item test set, better short phrases.
+# CFG baked at 1.0 (the teacher's pace at cfg 1 is in the 42-50 s target on
+# samples/text.txt); the student is sampled at cfg 1 with no null branch.
+model_config: pocket_tts/config/english_2026-09.yaml   # 6-layer student
+model_overrides:
+  flow_lm.lookup_table.tokenizer_path: /data/saudi-tts/segments/tokenizer.json
+start_from_pretrained: false
+distill_cfg_coef: 1.0
+distill_teacher_config: pocket_tts/config/english_2026-09_24l.yaml
+distill_teacher_overrides:
+  flow_lm.lookup_table.tokenizer_path: /data/saudi-tts/segments/tokenizer.json
+distill_teacher_weights: /data/saudi-tts/runs/teacher_saved/checkpoint_00140000.pt
+
+data:
+  train_jsonl: /data/saudi-tts/segments/train_aligned.jsonl
+  valid_jsonl: /data/saudi-tts/segments/valid_aligned.jsonl
+  max_duration_sec: 30.0
+  max_voice_prompt_sec: 5.0        # cap on the "preceding audio" part of the prompt
+  # Voice prompt modes: 35% reference clip only (start of an agent turn),
+  # 45% reference + preceding audio (later chunks of a turn), 20% preceding only.
+  ref_only_prob: 0.35
+  ref_ctx_prob: 0.45
+  min_ref_prompt_sec: 1.5
+  max_ref_prompt_sec: 5.0
+  # Keep most prompts exactly contiguous with the target so pause timing at
+  # chunk boundaries is learned precisely; trim 30% for robustness.
+  prompt_trim_max_sec: 0.5
+  prompt_trim_prob: 0.3
+  final_punct_dropout: 0.3
+  # The LLM writes the training convention; light dropout covers its slips.
+  tashkeel_dropout_all: 0.05
+  tashkeel_dropout_word: 0.03
+  # Interleaved text (seamless streaming): 0/1/2/3 extra text pieces inserted
+  # mid-target at word boundaries, each followed by an EOS probe. Inference appends
+  # the next sentence to the running sequence instead of starting a new utterance.
+  interleave_probs: [0.3, 0.3, 0.25, 0.15]
+  interleave_min_piece_sec: 1.0
+  interleave_punct_weight: 4.0
+  loader_procs: 6
+  num_bucket_batches: 5
+  precompute: true
+
+flow:
+  type: lsd
+  kwargs: {}
+
+text_dropout: 0.0
+voice_dropout: 0.0
+
+optim:
+  lr: 4e-4             # recipe: screened {1,2,4}e-4, 4e-4 clearly best
+  schedule: cosine
+  warmup_steps: 1000
+
+run_dir: /data/saudi-tts/runs/distill_6l
+batch_size: 64
+grad_accum_steps: 1
+max_steps: 200000      # recipe: WER at parity by ~50k; sim and UTMOS climb until ~150k
+ema_decay: 0.9999
+log_freq: 50
+valid_freq: 2500
+num_valid_batches: 20
+ckpt_freq: 2500
+num_ckpt_keep: 999
+sample_freq: 10000
+sample_cfg_coef: 1.0
+sample_sentences:
+  - "بِمَعنَى أَن المُشكِلَة فِي الِافتِقَار لِلِاتِّجَاه وَلَيس بِضِيق الوَقت"
+  - "بِالإِضَافَة ل أَنَا عِندِي كُورس قَاعدَة يَعنِي أَدرِس لَه، وَلَازِم أَنجَح فِيه."
